@@ -8,7 +8,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from lxml import etree
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -67,12 +67,55 @@ HL_WORDS = (
 )
 
 
+IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
+
 def nest_indent_cm(level: int) -> float:
     if level >= 5:
         return 0.75
     if level >= 4:
         return 0.45
     return 0.0
+
+
+# 配图统一画幅（等比缩放后居中贴白底），Word 里宽高一致
+IMG_BOX_W_CM = 12.0
+IMG_BOX_H_CM = 5.2
+IMG_DPI = 150
+
+
+def add_md_image(doc: Document, md_path: Path, rel: str):
+    import io
+
+    from PIL import Image as PILImage
+
+    img = (md_path.parent / rel.strip()).resolve()
+    if not img.is_file():
+        add_para(doc, f"[缺图] {rel}", size=9, color=H4_COLOR)
+        return
+    box_w = max(1, int(IMG_BOX_W_CM / 2.54 * IMG_DPI))
+    box_h = max(1, int(IMG_BOX_H_CM / 2.54 * IMG_DPI))
+    with PILImage.open(img) as im:
+        im = im.convert("RGBA")
+        scale = min(box_w / im.width, box_h / im.height)
+        nw = max(1, int(im.width * scale))
+        nh = max(1, int(im.height * scale))
+        resized = im.resize((nw, nh), PILImage.Resampling.LANCZOS)
+        canvas = PILImage.new("RGB", (box_w, box_h), (255, 255, 255))
+        canvas.paste(
+            resized,
+            ((box_w - nw) // 2, (box_h - nh) // 2),
+            resized,
+        )
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        buf.seek(0)
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(8)
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run()
+    run.add_picture(buf, width=Cm(IMG_BOX_W_CM), height=Cm(IMG_BOX_H_CM))
 
 
 def set_run_font(run, size=10.5, bold=False, color: RGBColor | None = None):
@@ -100,43 +143,423 @@ def set_table_keep(table):
         trPr.append(cant)
 
 
-def append_omml_frac(paragraph, num: str, den: str, size=10.5):
-    M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
-    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+def set_repeat_header(table):
+    """把首行设为跨页重复的表头行，避免表头被单独留在上一页。"""
+    if not len(table.rows):
+        return
+    tr = table.rows[0]._tr
+    trPr = tr.get_or_add_trPr()
+    hdr = OxmlElement("w:tblHeader")
+    hdr.set(qn("w:val"), "true")
+    trPr.append(hdr)
 
-    def el(tag):
-        return etree.Element(f"{{{M}}}{tag}")
 
-    def math_run(text: str):
-        r = el("r")
-        rpr = el("rPr")
-        sty = el("sty")
-        sty.set(f"{{{M}}}val", "p")
-        rpr.append(sty)
-        r.append(rpr)
-        wrpr = etree.Element(f"{{{W}}}rPr")
-        sz = etree.Element(f"{{{W}}}sz")
-        sz.set(f"{{{W}}}val", str(int(size * 2)))
-        szcs = etree.Element(f"{{{W}}}szCs")
-        szcs.set(f"{{{W}}}val", str(int(size * 2)))
-        wrpr.append(sz)
-        wrpr.append(szcs)
-        r.append(wrpr)
-        t = el("t")
-        t.text = text
-        r.append(t)
-        return r
+def keep_row_with_next(row):
+    """让该行的段落与下一行保持在同一页（表头不落单）。"""
+    for cell in row.cells:
+        for p in cell.paragraphs:
+            pPr = p._p.get_or_add_pPr()
+            kn = OxmlElement("w:keepNext")
+            pPr.append(kn)
 
-    omath = el("oMath")
-    f = el("f")
-    num_el = el("num")
-    den_el = el("den")
-    num_el.append(math_run(num))
-    den_el.append(math_run(den))
-    f.append(num_el)
-    f.append(den_el)
-    omath.append(f)
+
+M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+# LaTeX 命令 -> Word 纯文本符号（只影响外观，不参与结构）
+TEX_SYMBOLS = {
+    r"\times": "×",
+    r"\Delta": "Δ",
+    r"\delta": "δ",
+    r"\div": "÷",
+    r"\pm": "±",
+    r"\mp": "∓",
+    r"\approx": "≈",
+    r"\ne": "≠",
+    r"\neq": "≠",
+    r"\le": "≤",
+    r"\leq": "≤",
+    r"\ge": "≥",
+    r"\geq": "≥",
+    r"\rightarrow": "→",
+    r"\to": "→",
+    r"\Rightarrow": "⇒",
+    r"\cdot": "·",
+    r"\ldots": "…",
+    r"\dots": "…",
+    r"\cdots": "⋯",
+    r"\infty": "∞",
+    r"\prime": "′",
+    r"\circ": "°",
+    r"\degree": "°",
+    r"\qquad": "    ",
+    r"\quad": "  ",
+    r"\left": "",
+    r"\right": "",
+    r"\, ": " ",
+    r"\,": " ",
+    r"\;": " ",
+    r"\!": "",
+    r"\ ": " ",
+}
+
+# 只包裹内容、内容本身按普通文本渲染的命令
+TEX_TEXT_CMDS = {"text", "mathrm", "mathbf", "textbf", "textit", "mbox", "operatorname"}
+
+# 支持分数的命令
+TEX_FRAC_CMDS = {"frac", "dfrac", "tfrac", "cfrac"}
+
+
+def _tex_el(tag):
+    return etree.Element(f"{{{M}}}{tag}")
+
+
+def _tex_math_run(text, size=10.5, bold=False):
+    """生成 OMML 的普通文本 run。"""
+    r = _tex_el("r")
+    rpr = _tex_el("rPr")
+    sty = _tex_el("sty")
+    sty.set(f"{{{M}}}val", "p")
+    rpr.append(sty)
+    r.append(rpr)
+
+    wrpr = etree.Element(f"{{{W}}}rPr")
+    # 必须指定 Cambria Math，否则 Word 编辑器实时校验会报"数学公式错误"
+    rfonts = etree.Element(f"{{{W}}}rFonts")
+    rfonts.set(qn("w:ascii"), "Cambria Math")
+    rfonts.set(qn("w:hAnsi"), "Cambria Math")
+    rfonts.set(qn("w:eastAsia"), "Cambria Math")
+    wrpr.append(rfonts)
+    if bold:
+        wrpr.append(etree.Element(f"{{{W}}}b"))
+    sz = etree.Element(f"{{{W}}}sz")
+    sz.set(f"{{{W}}}val", str(int(round(size * 2))))
+    wrpr.append(sz)
+    szcs = etree.Element(f"{{{W}}}szCs")
+    szcs.set(f"{{{W}}}val", str(int(round(size * 2))))
+    wrpr.append(szcs)
+    r.append(wrpr)
+
+    t = _tex_el("t")
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t.text = text
+    r.append(t)
+    return r
+
+
+def _tex_group(container, latex, size=10.5, bold=False):
+    """把一段 LaTeX 片段转成 OMML 节点，append 到 container。支持嵌套。"""
+    i = 0
+    n = len(latex)
+
+    def read_group(start):
+        """从 '{' 处读取到配对的 '}'，返回 (内容, 结束索引)。"""
+        depth = 0
+        j = start
+        while j < n:
+            c = latex[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return latex[start + 1 : j], j + 1
+            j += 1
+        return latex[start + 1 :], n
+
+    while i < n:
+        c = latex[i]
+
+        # 上下标运算符 ^ _（须在普通文本分支之前判断）
+        if c in "^_":
+            j = i + 1
+            while j < n and latex[j] in " \t":
+                j += 1
+            if j < n and latex[j] == "{":
+                script, j = read_group(j)
+            elif j < n:
+                script = latex[j]
+                j += 1
+            else:
+                script = ""
+
+            # 找到上一个已生成的节点作为底数
+            if len(container):
+                base = container[-1]
+                tag = "sSup" if c == "^" else "sSub"
+                node = _tex_el(tag)
+                e = _tex_el("e")
+                container.remove(base)
+                e.append(base)
+                sub = _tex_el("sup" if c == "^" else "sub")
+                _tex_group(sub, script, size=size, bold=bold)
+                node.append(e)
+                node.append(sub)
+                container.append(node)
+            else:
+                container.append(_tex_math_run(c, size=size, bold=bold))
+            i = j
+            continue
+
+        if c not in "\\{}":
+            j = i
+            while j < n and latex[j] not in "\\{}^_":
+                j += 1
+            seg = latex[i:j]
+            if seg.strip() or seg == " ":
+                container.append(_tex_math_run(seg, size=size, bold=bold))
+            i = j
+            continue
+
+        if c == "{":
+            content, i = read_group(i)
+            container.append(_tex_math_run(content, size=size, bold=bold))
+            continue
+
+        if c == "}":
+            i += 1
+            continue
+
+        # 反斜杠命令
+        m = re.match(r"\\([A-Za-z]+)", latex[i:])
+        if m:
+            cmd = m.group(1)
+            name = "\\" + cmd
+            j = i + m.end()
+
+            # 分数（可嵌套）
+            if cmd in TEX_FRAC_CMDS:
+                while j < n and latex[j] in " \t":
+                    j += 1
+                if j < n and latex[j] == "[":
+                    k = latex.find("]", j)
+                    j = (k + 1) if k != -1 else j + 1
+                while j < n and latex[j] in " \t":
+                    j += 1
+                num, j = read_group(j)
+                while j < n and latex[j] in " \t":
+                    j += 1
+                den, j = read_group(j)
+
+                frac = _tex_el("f")
+                fpr = _tex_el("fPr")
+                ftype = _tex_el("type")
+                ftype.set(f"{{{M}}}val", "bar")
+                fpr.append(ftype)
+                frac.append(fpr)
+                num_el = _tex_el("num")
+                den_el = _tex_el("den")
+                _tex_group(num_el, num, size=size, bold=bold)
+                _tex_group(den_el, den, size=size, bold=bold)
+                frac.append(num_el)
+                frac.append(den_el)
+                container.append(frac)
+                i = j
+                continue
+
+            # 文本类命令
+            if cmd in TEX_TEXT_CMDS:
+                while j < n and latex[j] in " \t":
+                    j += 1
+                if j < n and latex[j] == "{":
+                    content, j = read_group(j)
+                    container.append(_tex_math_run(content, size=size, bold=bold))
+                    i = j
+                    continue
+                container.append(_tex_math_run(name, size=size, bold=bold))
+                i = j
+                continue
+
+            # 平方根
+            if cmd == "sqrt":
+                while j < n and latex[j] in " \t":
+                    j += 1
+                rad = _tex_el("rad")
+                radpr = _tex_el("radPr")
+                dh = _tex_el("degHide")
+                dh.set(f"{{{M}}}val", "1")
+                radpr.append(dh)
+                rad.append(radpr)
+                rad.append(_tex_el("deg"))
+                e = _tex_el("e")
+                if j < n and latex[j] == "{":
+                    content, j = read_group(j)
+                else:
+                    content, j = latex[j], j + 1
+                _tex_group(e, content, size=size, bold=bold)
+                rad.append(e)
+                container.append(rad)
+                i = j
+                continue
+
+            # 符号替换
+            if name in TEX_SYMBOLS:
+                container.append(_tex_math_run(TEX_SYMBOLS[name], size=size, bold=bold))
+                i = j
+                continue
+
+            # 未知命令：保留原样，避免信息丢失
+            container.append(_tex_math_run(name, size=size, bold=bold))
+            i = j
+            continue
+
+        # 上下标运算符 ^ _
+        if c in "^_":
+            j = i + 1
+            while j < n and latex[j] in " \t":
+                j += 1
+            if j < n and latex[j] == "{":
+                script, j = read_group(j)
+            elif j < n:
+                script = latex[j]
+                j += 1
+            else:
+                script = ""
+
+            # 找到上一个已生成的节点作为底数
+            if len(container):
+                base = container[-1]
+                tag = "sSup" if c == "^" else "sSub"
+                node = _tex_el(tag)
+                e = _tex_el("e")
+                # 把 base 移入 e
+                container.remove(base)
+                e.append(base)
+                sub = _tex_el("sup" if c == "^" else "sub")
+                _tex_group(sub, script, size=size, bold=bold)
+                node.append(e)
+                node.append(sub)
+                container.append(node)
+            else:
+                container.append(_tex_math_run(c, size=size, bold=bold))
+            i = j
+            continue
+
+        # 转义字符 \% \$ \& \# \{ \} \_
+        esc = re.match(r"\\([%&#$_{}])", latex[i:])
+        if esc:
+            container.append(_tex_math_run(esc.group(1), size=size, bold=bold))
+            i += esc.end()
+            continue
+
+        container.append(_tex_math_run("\\", size=size, bold=bold))
+        i += 1
+
+    return container
+
+
+def append_omml_math(paragraph, latex, size=10.5, bold=False):
+    """把一段 LaTeX 公式转成 Word 原生公式（OMML）并插入段落。"""
+    latex = latex.strip()
+    if not latex:
+        return
+    omath = _tex_el("oMath")
+    _tex_group(omath, latex, size=size, bold=bold)
     paragraph._p.append(omath)
+
+
+def extract_math_segments(text):
+    """从一段文本里抽出所有数学片段。
+
+    返回 [(kind, payload)]，kind:
+      - 'math' -> LaTeX 源码（不含分隔符）
+      - 'text' -> 普通文本
+    支持 $$...$$、\\[...\\]、\\(...\\)、$...$
+    """
+    segments = []
+    i = 0
+    n = len(text)
+    buf = []
+
+    def flush():
+        if buf:
+            segments.append(("text", "".join(buf)))
+            buf.clear()
+
+    while i < n:
+        if text.startswith("$$", i):
+            end = text.find("$$", i + 2)
+            if end != -1:
+                flush()
+                segments.append(("math", text[i + 2 : end].strip()))
+                i = end + 2
+                continue
+        if text.startswith("\\[", i):
+            end = text.find("\\]", i + 2)
+            if end != -1:
+                flush()
+                segments.append(("math", text[i + 2 : end].strip()))
+                i = end + 2
+                continue
+        if text.startswith("\\(", i):
+            end = text.find("\\)", i + 2)
+            if end != -1:
+                flush()
+                segments.append(("math", text[i + 2 : end].strip()))
+                i = end + 2
+                continue
+        if text[i] == "$":
+            end = text.find("$", i + 1)
+            if end != -1:
+                body = text[i + 1 : end]
+                # 判定为公式：不能跨行，且要么含 LaTeX 命令，
+                # 要么是无空格短片段（排除 "$100" 这类货币写法）
+                if body.strip() and "\n" not in body:
+                    has_cmd = "\\" in body
+                    no_space = " " not in body.strip()
+                    if has_cmd or no_space:
+                        flush()
+                        segments.append(("math", body.strip()))
+                        i = end + 1
+                        continue
+        buf.append(text[i])
+        i += 1
+
+    flush()
+    return segments
+
+
+BARE_TEX_RE = re.compile(
+    r"\\(?:frac|dfrac|tfrac|cfrac|sqrt|text|mathrm|mathbf|textbf|times|div|pm|mp|approx|ne|neq|le|leq|ge|geq|rightarrow|to|Rightarrow|cdot|ldots|dots|cdots|infty|prime|circ|degree|qquad|quad|left|right)\b"
+)
+
+
+def _split_bare_tex(text):
+    """把混在普通文本里的裸 LaTeX 命令切出来，返回 [(is_math, payload)]。"""
+    out = []
+    pos = 0
+    for m in BARE_TEX_RE.finditer(text):
+        if m.start() > pos:
+            out.append((False, text[pos : m.start()]))
+        # 取出该命令对应的完整片段（含它后面可能跟的 {} 参数）
+        chunk = m.group(0)
+        # 分数：接管后续两个花括号组
+        if m.group(0).lstrip("\\") in TEX_FRAC_CMDS:
+            j = m.end()
+            for _ in range(2):
+                while j < len(text) and text[j] in " \t":
+                    j += 1
+                if j < len(text) and text[j] == "{":
+                    depth = 0
+                    k = j
+                    while k < len(text):
+                        if text[k] == "{":
+                            depth += 1
+                        elif text[k] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k += 1
+                    if k < len(text):
+                        chunk = text[m.start() : k + 1]
+                        j = k + 1
+                    else:
+                        break
+        out.append((True, chunk))
+        pos = m.start() + len(chunk)
+    if pos < len(text):
+        out.append((False, text[pos:]))
+    return out
 
 
 def append_hl_text(p, text, size=10.5, bold=False, color=None):
@@ -158,15 +581,48 @@ def append_hl_text(p, text, size=10.5, bold=False, color=None):
 
 
 def append_text_with_frac(p, text, size=10.5, bold=False, color=None):
-    pieces = re.split(r"(\\frac\{[^{}]+\}\{[^{}]+\})", text)
-    for piece in pieces:
-        if not piece:
-            continue
-        m = re.fullmatch(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", piece)
-        if m:
-            append_omml_frac(p, m.group(1), m.group(2), size=size)
+    """把可能含 LaTeX 公式的文本渲染进段落：公式转 OMML，其余走普通 run。"""
+    if not text:
+        return
+    for kind, payload in extract_math_segments(text):
+        if kind == "math":
+            if payload:
+                append_omml_math(p, payload, size=size, bold=bold)
         else:
-            append_hl_text(p, piece, size=size, bold=bold, color=color)
+            # 文本段里可能混有裸 LaTeX 命令（如 \frac{...}{...}）
+            for is_math, sub in _split_bare_tex(payload):
+                if not sub:
+                    continue
+                if is_math:
+                    append_omml_math(p, sub, size=size, bold=bold)
+                else:
+                    append_hl_text(p, sub, size=size, bold=bold, color=color)
+
+
+def _has_math(text):
+    """判断一段文本里是否含 LaTeX 公式。"""
+    if not text:
+        return False
+    if re.search(r"\\(frac|dfrac|tfrac|cfrac)\b", text):
+        return True
+    for kind, _ in extract_math_segments(text):
+        if kind == "math":
+            return True
+    return False
+
+
+def add_formula_para(doc, latex, size=10.5, space_after=4, space_before=2, indent_cm=0.0):
+    """块级公式：渲染为 Word 原生公式（OMML），居中。"""
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(space_before)
+    p.paragraph_format.space_after = Pt(space_after)
+    p.paragraph_format.line_spacing = 1.4
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if indent_cm:
+        p.paragraph_format.left_indent = Cm(indent_cm)
+    if latex.strip():
+        append_omml_math(p, latex, size=size)
+    return p
 
 
 def add_para(doc, text, size=10.5, bold=False, space_after=2, indent_cm=0.0, space_before=0, color=None):
@@ -175,8 +631,8 @@ def add_para(doc, text, size=10.5, bold=False, space_after=2, indent_cm=0.0, spa
     frac_after = 1 if COMPACT else 8
     frac_ls = 1.12 if COMPACT else 1.6
     body_after = 0 if COMPACT else space_after
-    p.paragraph_format.space_after = Pt(max(body_after, frac_after) if "\\frac" in text else body_after)
-    if "\\frac" in text:
+    p.paragraph_format.space_after = Pt(max(body_after, frac_after) if _has_math(text) else body_after)
+    if _has_math(text):
         p.paragraph_format.line_spacing = frac_ls
     else:
         p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
@@ -219,7 +675,7 @@ def fill_rich_cell(cell, txt, font_size, header=False):
         p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(1 if COMPACT else 2)
-        p.paragraph_format.line_spacing = 1.3 if "\\frac" in chunk else 1.0
+        p.paragraph_format.line_spacing = 1.3 if _has_math(chunk) else 1.0
         labeled = False
         if not header:
             for lab in FORMULA_LABELS:
@@ -299,6 +755,9 @@ def flush_table(doc, rows, indent_cm=0.0):
                 tcMar.append(node)
             tcPr.append(tcMar)
     set_table_keep(t)
+    set_repeat_header(t)
+    if len(t.rows) > 1:
+        keep_row_with_next(t.rows[0])
     set_table_indent(t, indent_cm)
     sp = doc.add_paragraph()
     sp.paragraph_format.space_after = Pt(2)
@@ -338,12 +797,12 @@ def md_to_docx(md_path: Path, docx_path: Path):
                 formula_buf = []
                 rest = line.strip()[2:].strip()
                 if rest.endswith("$$"):
-                    add_para(doc, rest[:-2].strip(), size=10)
+                    add_formula_para(doc, rest[:-2].strip(), size=10)
                     in_formula = False
                 elif rest:
                     formula_buf.append(rest)
             else:
-                add_para(doc, " ".join(formula_buf), size=10)
+                add_formula_para(doc, " ".join(formula_buf), size=10)
                 in_formula = False
                 formula_buf = []
             i += 1
@@ -351,7 +810,7 @@ def md_to_docx(md_path: Path, docx_path: Path):
         if in_formula:
             if line.strip().endswith("$$"):
                 formula_buf.append(line.strip()[:-2])
-                add_para(doc, " ".join(formula_buf), size=10)
+                add_formula_para(doc, " ".join(formula_buf), size=10)
                 in_formula = False
                 formula_buf = []
             else:
@@ -372,6 +831,11 @@ def md_to_docx(md_path: Path, docx_path: Path):
             continue
         if in_code:
             code_buf.append(line)
+            i += 1
+            continue
+        img_m = IMG_RE.fullmatch(line.strip())
+        if img_m:
+            add_md_image(doc, md_path, img_m.group(2))
             i += 1
             continue
         if line.strip().startswith("|"):
