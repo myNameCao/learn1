@@ -116,8 +116,41 @@ def write_sheet(ws, rows: list[dict], table_name: str):
     ws.print_title_rows = "1:1"
 
 
-def md_to_xlsx(md_path: Path, xlsx_path: Path):
-    four, two = collect_entries(md_path.read_text(encoding="utf-8"))
+STEM_MARK_RE = re.compile(
+    r"<!--\s*stem:([^|>]+?)(?:\s*\|\s*out:(docx|xlsx))?\s*-->",
+    re.I,
+)
+SOURCE_MD = BASE / "笔记生成源.md"
+
+
+def split_source(md_text: str) -> dict[str, tuple[str, str]]:
+    parts: dict[str, tuple[str, str]] = {}
+    matches = list(STEM_MARK_RE.finditer(md_text))
+    for i, m in enumerate(matches):
+        stem = m.group(1).strip()
+        kind = (m.group(2) or "docx").lower()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        parts[stem] = (md_text[start:end].strip() + "\n", kind)
+    return parts
+
+
+def resolve_md_text(stem: str) -> str | None:
+    if SOURCE_MD.exists():
+        parts = split_source(SOURCE_MD.read_text(encoding="utf-8"))
+        if stem in parts:
+            body, kind = parts[stem]
+            if kind != "xlsx":
+                return None
+            return body
+    standalone = BASE / f"{stem}.md"
+    if standalone.exists():
+        return standalone.read_text(encoding="utf-8")
+    return None
+
+
+def md_to_xlsx(xlsx_path: Path, md_text: str):
+    four, two = collect_entries(md_text)
     wb = Workbook()
     ws = wb.active
     ws.title = "四字成语"
@@ -136,15 +169,19 @@ def md_to_xlsx(md_path: Path, xlsx_path: Path):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    names = args or ["词语积累笔记"]
-    for name in names:
-        stem = name[:-3] if name.endswith(".md") else name
-        md_path = BASE / f"{stem}.md"
-        xlsx_path = BASE / f"{stem}.xlsx"
-        if not md_path.exists():
-            print("MISSING", md_path.name)
+    if args:
+        names = [a[:-3] if a.endswith(".md") else a for a in args]
+    elif SOURCE_MD.exists():
+        parts = split_source(SOURCE_MD.read_text(encoding="utf-8"))
+        names = [s for s, (_, k) in parts.items() if k == "xlsx"]
+    else:
+        names = ["词语积累笔记"]
+    for stem in names:
+        text = resolve_md_text(stem)
+        if text is None:
+            print("MISSING", stem)
             continue
-        md_to_xlsx(md_path, xlsx_path)
+        md_to_xlsx(BASE / f"{stem}.xlsx", text)
 
 
 if __name__ == "__main__":

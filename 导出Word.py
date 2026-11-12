@@ -765,10 +765,10 @@ def flush_table(doc, rows, indent_cm=0.0):
         sp.paragraph_format.left_indent = Cm(indent_cm)
 
 
-def md_to_docx(md_path: Path, docx_path: Path):
+def md_to_docx(md_path: Path, docx_path: Path, md_text: str | None = None):
     global COMPACT
-    COMPACT = md_path.stem == "常用公式"
-    md = md_path.read_text(encoding="utf-8")
+    COMPACT = md_path.stem == "常用公式" or docx_path.stem == "常用公式"
+    md = md_text if md_text is not None else md_path.read_text(encoding="utf-8")
     doc = Document()
     for section in doc.sections:
         m = 0.55 if COMPACT else 1.0
@@ -950,23 +950,63 @@ def md_to_docx(md_path: Path, docx_path: Path):
         print("LOCKED", docx_path.name, "->", alt.name)
 
 
+STEM_MARK_RE = re.compile(
+    r"<!--\s*stem:([^|>]+?)(?:\s*\|\s*out:(docx|xlsx))?\s*-->",
+    re.I,
+)
+SOURCE_MD = BASE / "笔记生成源.md"
+
+
+def split_source(md_text: str) -> dict[str, tuple[str, str]]:
+    """stem -> (body, out_kind). out_kind is docx or xlsx."""
+    parts: dict[str, tuple[str, str]] = {}
+    matches = list(STEM_MARK_RE.finditer(md_text))
+    if not matches:
+        return parts
+    for i, m in enumerate(matches):
+        stem = m.group(1).strip()
+        kind = (m.group(2) or "docx").lower()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        body = md_text[start:end].strip() + "\n"
+        parts[stem] = (body, kind)
+    return parts
+
+
+def resolve_md_body(stem: str) -> tuple[Path, str] | None:
+    """Prefer 笔记生成源.md section; fall back to standalone stem.md."""
+    if SOURCE_MD.exists():
+        parts = split_source(SOURCE_MD.read_text(encoding="utf-8"))
+        if stem in parts:
+            body, kind = parts[stem]
+            if kind == "xlsx":
+                return None
+            return SOURCE_MD, body
+    standalone = BASE / f"{stem}.md"
+    if standalone.exists():
+        return standalone, standalone.read_text(encoding="utf-8")
+    return None
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if args:
-        names = args
+        names = [a[:-3] if a.endswith(".md") else a for a in args]
+    elif SOURCE_MD.exists():
+        parts = split_source(SOURCE_MD.read_text(encoding="utf-8"))
+        names = [s for s, (_, k) in parts.items() if k == "docx"]
     else:
         names = ["言语理解笔记"]
-    for name in names:
-        stem = name[:-3] if name.endswith(".md") else name
-        md_path = BASE / f"{stem}.md"
-        docx_path = BASE / f"{stem}.docx"
+    for stem in names:
         if stem == "词语积累笔记":
-            print("SKIP", md_path.name, "(use 导出Excel.py)")
+            print("SKIP", stem, "(use 导出Excel.py)")
             continue
-        if not md_path.exists():
-            print("MISSING", md_path.name)
+        resolved = resolve_md_body(stem)
+        if not resolved:
+            print("MISSING", stem)
             continue
-        md_to_docx(md_path, docx_path)
+        md_path, body = resolved
+        md_to_docx(md_path, BASE / f"{stem}.docx", md_text=body)
 
 
 if __name__ == "__main__":
