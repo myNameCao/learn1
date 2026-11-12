@@ -14,7 +14,9 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-BASE = Path(__file__).resolve().parent
+TOOL_DIR = Path(__file__).resolve().parent
+ROOT = TOOL_DIR.parent  # docx/xlsx、配图所在根目录
+BASE = ROOT
 COMPACT = False
 H2_COLOR = RGBColor(0x1F, 0x6B, 0xB5)
 H4_COLOR = RGBColor(0xC0, 0x39, 0x2B)
@@ -954,7 +956,7 @@ STEM_MARK_RE = re.compile(
     r"<!--\s*stem:([^|>]+?)(?:\s*\|\s*out:(docx|xlsx))?\s*-->",
     re.I,
 )
-SOURCE_MD = BASE / "笔记生成源.md"
+SOURCE_MD = TOOL_DIR / "笔记生成源.md"
 
 
 def split_source(md_text: str) -> dict[str, tuple[str, str]]:
@@ -981,7 +983,8 @@ def resolve_md_body(stem: str) -> tuple[Path, str] | None:
             body, kind = parts[stem]
             if kind == "xlsx":
                 return None
-            return SOURCE_MD, body
+            # 配图相对根目录（图推配图/…），故用 ROOT 作 md 基准路径
+            return ROOT / "笔记生成源.md", body
     standalone = BASE / f"{stem}.md"
     if standalone.exists():
         return standalone, standalone.read_text(encoding="utf-8")
@@ -998,7 +1001,7 @@ def main():
     else:
         names = ["言语理解笔记"]
     for stem in names:
-        if stem == "词语积累笔记":
+        if stem in ("词语本", "词语积累笔记"):
             print("SKIP", stem, "(use 导出Excel.py)")
             continue
         resolved = resolve_md_body(stem)
