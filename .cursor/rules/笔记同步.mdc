@@ -1,0 +1,13 @@
+---
+description: 直接读写 Word/Excel，不用 MD，不跑导出脚本
+alwaysApply: true
+---
+
+# 笔记操作方式
+
+1. **不导出**：不要运行 `_生成/导出Word.py`、`_生成/导出Excel.py`，不要维护或回写 `笔记生成源.md`。
+2. **直接访问 / 修改**：
+   - 各科笔记 → 根目录对应 `.docx`（如 `言语理解笔记.docx`）
+   - 词语本 → 根目录 `词语本.xlsx`
+3. 用 **python-docx** 改 Word，用 **openpyxl** 改 Excel；读内容也直接打开这些文件。
+4. 用户手动改过的 doc/xlsx 即为准绳。
