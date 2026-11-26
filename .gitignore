@@ -4,6 +4,9 @@ _旧版本/
 _backup_md/
 _pdf_preview/
 
+# === WorkBuddy 记忆文件（不上传） ===
+.workbuddy/
+
 # Word/WPS/Office 锁文件与临时文件
 ~$*
 *.tmp
